@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Template description goes here
+
+Parameters:
+
+  GithubRepo:
+    Description: Full Repository name including Owner, ex - MyOrg/myRepository
+    Type: String
+
+  GithubConnector:
+    Description: The CodeStar connector Arn to GitHub
+    Type: String
+    Default: '{{resolve:ssm:/devops/codepipeline/github-connector:1}}'
+
+  KMSKey:
+    Description: KMS Key ARN used to Encrypt the projects S3 Bucket
+    Type: String
+    Default: '{{resolve:ssm:/devops/codepipeline/kmsarn:1}}'
+    MinLength : 10
+
+  ProdAccountNumber:
+    Description: The AWS production account number for cross account deployments
+    Type: String
+    Default: '{{resolve:ssm:/devops/codepipeline/prodaccountid:1}}'
+    MinLength : 12
+
+  CrossAccountRole:
+    Description: Pipeline Asssumes this Production trusted Cross Account Role
+    Type: String
+    Default: '{{resolve:ssm:/devops/codepipeline/crossaccountrole:1}}'
+  
+Resources:
+
+  # CodeBuild project and resources (S3 Bucket for build artifacts, Role, Project)
+  BuildArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !Ref KMSKey
+      Tags:
+        - Key: Stack
+          Value: !Ref AWS::StackName
+        - Key: Name
+          Value: !Ref GithubRepo
+        - Key: ApplicationRole
+          Value: ArtifactsBucket
+        - Key: Department
+          Value: I.T.
+    
+
+  BuildArtifactsBucketPolicies:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BuildArtifactsBucket
+      PolicyDocument:
+        Statement:
+          - Principal:
+              AWS: !Sub 'arn:aws:iam::${ProdAccountNumber}:root'
+            Effect: Allow
+            Action:
+              - 's3:Get*'
+              - 's3:Put*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+          - Principal:
+              AWS: !Sub 'arn:aws:iam::${ProdAccountNumber}:root'
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}'
