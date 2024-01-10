@@ -7,6 +7,7 @@ Parameters:
   GithubRepo:
     Description: Full Repository name including Owner, ex - MyOrg/myRepository
     Type: String
+    AllowedPattern: "[\\w-_]+\\/[\\w-_]+"
 
   GithubConnector:
     Description: The CodeStar connector Arn to GitHub
@@ -35,7 +36,8 @@ Resources:
   # CodeBuild project and resources (S3 Bucket for build artifacts, Role, Project)
   BuildArtifactsBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -52,7 +54,7 @@ Resources:
         - Key: Department
           Value: I.T.
     
-
+  # S3 Bucket Policy allows Production account to access the build artifacts.
   BuildArtifactsBucketPolicies:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -74,3 +76,364 @@ Resources:
               - 's3:ListBucket'
             Resource:
               - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}'
+
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 
+        - "${projectName}-CodeBuild"
+        - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+      Description: !Sub
+        - "Build project for ${projectName}"
+        - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+      Artifacts:
+        Type: CODEPIPELINE
+      EncryptionKey: !Ref KMSKey
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0 # More info on Images: https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-available.html
+        EnvironmentVariables:
+          - Name: BUILD_OUTPUT_BUCKET
+            Value: !Ref BuildArtifactsBucket
+      Cache:
+        Type: S3
+        Location: !Sub ${BuildArtifactsBucket}/codebuild-cache
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      Tags: 
+        - Key: "Stack"
+          Value: !Ref AWS::StackName
+
+  # Create an IAM role for CodeBuild with these policies:
+  # - Allow the creation of Log Groups/Streams and to Put Events
+  # - Allow Put and Get operations to the Build Artifacts S3 Bucket
+  # - Allow Get operations from the SSM Parameter Store
+  # - Allow KMS Key access to encrypt / decrypt from a shared key
+  # - Allow CodeBuild to disable the CodePipeline transisition to production
+  # - Allow CodeBuild Reports operations
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - "${projectName}-CodeBuildServiceRole"
+        - projectName: !Select [1, !Split ['/', !Ref GithubRepo]]
+      Tags:
+        - Key: Department
+          Value: I.T.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+            - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub
+                      - "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${projectName}"
+                      - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+                  - !Sub
+                      - "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${projectName}:*"
+                      - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]] 
+        - PolicyName: CodeBuildArtifactsBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+        - PolicyName: CodeBuildParameterStore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'ssm:GetParameters'
+                Resource: '*'
+        - PolicyName: KmsBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !Ref KMSKey
+        - PolicyName: CodeBuildCodePipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'codepipeline:DisableStageTransition'
+                Resource:
+                  - !Sub 
+                      - "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${projectName}*/Prod"
+                      - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+        - PolicyName: CodeBuildReports
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - codebuild:CreateReport
+                  - codebuild:CreateReportGroup
+                  - codebuild:BatchPutCodeCoverages
+                  - codebuild:BatchPutTestCases
+                  - codebuild:UpdateReport
+                Resource:
+                  - !Sub 
+                      - "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${projectName}*"
+                      - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+
+
+  PipelineDev:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref BuildArtifactsBucket
+        Type: S3
+      Name: !Sub 
+        - "${projectName}-dev-pipeline"
+        - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+      RoleArn: !GetAtt CodePipelineExecutionRole.Arn
+      Tags: 
+        - Key: SourceControlProvider
+          Value: GitHub
+        - Key: Repository
+          Value: !Ref GithubRepo
+        - Key: Department
+          Value: I.T.
+        - Key: Environment
+          Value: Dev
+        - Key: Branch
+          Value: develop
+        - Key: ApplicationRole
+          Value: CI/CD
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceCodeRepo
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                BranchName: develop
+                ConnectionArn: !Ref GithubConnector
+                FullRepositoryId: !Ref GithubRepo
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceCodeAsZip
+              RunOrder: 1
+        - Name: Build
+          Actions: 
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts: 
+                - Name: SourceCodeAsZip
+              OutputArtifacts:
+                - Name: BuildArtifactAsZip
+        - Name: DEV
+          Actions:
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                StackName: !Sub
+                  - "${projectName}-dev-stack"
+                  - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+                ChangeSetName: !Sub
+                  - "${projectName}-ChangeSet-DEV"
+                  - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+                TemplatePath: BuildArtifactAsZip::packaged-dev.yaml
+                Capabilities: CAPABILITY_IAM
+              InputArtifacts:
+                - Name: BuildArtifactAsZip
+              RunOrder: 1
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ParameterOverrides: '{"Environment": "DEV"}'
+                RoleArn: !GetAtt CloudFormationExecutionRole.Arn
+                StackName: !Sub
+                  - "${projectName}-dev-stack"
+                  - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+                ChangeSetName: !Sub
+                  - "${projectName}-ChangeSet-DEV"
+                  - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+              OutputArtifacts:
+                - Name: !Sub
+                  - "${projectName}DEVChangeSet"
+                  - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+              RunOrder: 2
+
+  CloudFormationExecutionRole: 
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - "${projectName}-CloudFormationExecutionRole"
+        - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+      Tags:
+        - Key: Department
+          Value: I.T.
+        - Key: ApplicationRole
+          Value: Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Action: 'sts:AssumeRole'
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+
+  CodePipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - "${projectName}-CodePipelineExecutionRole"
+        - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+      Path: /
+      Policies: 
+        - PolicyName: FullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+        - PolicyName: CodePipelineCodeAndArtifactsS3Bucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 's3:*'
+                Resource: !Sub 'arn:aws:s3:::${BuildArtifactsBucket}/*'
+        - PolicyName: CodePipelineCodeBuildAndCloudformationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: 
+              - Effect: Allow
+                Action:
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:BatchGetBuilds'
+                Resource: !Sub 'arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CodeBuildProject}'
+              - Effect: Allow
+                Action:
+                  - 'cloudformation:CreateStack'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:DeleteStack'
+                  - 'cloudformation:UpdateStack'
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:SetStackPolicy'
+                  - 'cloudformation:SetStackPolicy'
+                  - 'cloudformation:ValidateTemplate'
+                Resource:
+                  - !Sub
+                    - 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${projectName}*/*'
+                    - projectName: !Select [1, !Split [ "/", !Ref GithubRepo]]
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+
+  CloudFormationGitSyncRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 
+        - '${projectName}-GitSync'
+        - projectName: !Select 
+            - 1
+            - !Split 
+              - /
+              - !Ref GithubRepo
+      Policies:
+        - PolicyName: SyncToCloudFormation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: SyncToCloudFormation
+                Effect: Allow
+                Action:
+                  - 'cloudformation:CreateChangeSet'
+                  - 'cloudformation:DeleteChangeSet'
+                  - 'cloudformation:DescribeChangeSet'
+                  - 'cloudformation:DescribeStackEvents'
+                  - 'cloudformation:DescribeStacks'
+                  - 'cloudformation:ExecuteChangeSet'
+                  - 'cloudformation:GetTemplate'
+                  - 'cloudformation:ListChangeSets'
+                  - 'cloudformation:ListStacks'
+                  - 'cloudformation:ValidateTemplate'
+                Resource: '*'
+              - Sid: PolicyForManagedRules
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                Resource: '*'
+                Condition:
+                  StringEquals: 
+                    events:ManagedBy: 
+                      - cloudformation.sync.codeconnections.amazonaws.com
+              - Sid: PolicyForDescribingRule
+                Effect: 'Allow'
+                Action: 'events:DescribeRule'
+                Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: 'cloudformation.sync.codeconnections.amazonaws.com'
+      Path: /
